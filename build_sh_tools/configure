@@ -1,0 +1,367 @@
+#!/usr/bin/env sh
+
+### POSIX NON-COMPLAINT UTILS
+
+dir_stack=""
+
+pushd() {
+	dir_stack="$PWD $dir_stack"
+	cd "$1"
+}
+
+popd() {
+	cd "${dir_stack%% *}"
+	dir_stack="${dir_stack#* }"
+}
+
+item_exists() {
+	for item in $2; do
+		[ "$item" = "$1" ] && return 0
+	done
+	return 1
+}
+
+match_pattern() {
+	case "$1" in
+		$2)
+			return 0
+			;;
+		*)
+			return 1
+			;;
+	esac
+}
+
+### END
+
+### UTILS
+
+prompt_yes_no() {
+	while true; do
+		printf "%s [y/n] " "$1"
+		read -r response
+
+		case $response in
+			[yY])
+				return 0  # User entered 'y' or 'Y'
+				;;
+			[nN])
+				return 1  # User entered 'n' or 'N'
+				;;
+			*)
+				echo "Invalid input. Please enter 'y' or 'n'."
+				;;
+		esac
+	done
+}
+
+### UTILS END
+
+HELP_MSG="Usage: $0 [options]
+Options: [defaults in brackets after descriptions]
+
+Standard options:
+  --help                   print this message
+  --prefix PREFIX          install in PREFIX [/usr/local]
+
+Advanced options (experts only):
+  --cc CC                  use C compiler CC [gcc]
+  --ar AR                  create archives using AR [ar]
+  --extra-cflags FLAGS     specify compiler flags [-Wall -g -O2]
+  --extra-ldflags FLAGS    specify linker options []
+  --strip-binaries         strip symbol tables from resulting binaries
+  --enable-static          enable generation of static libraries
+  --enable-debug           enable debug symbols"
+
+SRCDIR="$PWD"
+PREFIX='/usr/local'
+CC='cc'
+AR='ar'
+STRIP_BINARIES=0
+DEBUG=0
+EXTRA_CFLAGS='-Wall -O2'
+EXTRA_LDFLAGS=''
+STATIC=0
+
+fn_exists() {
+    type "$1" > /dev/null 2>&1
+    return $?
+}
+
+generated_targets=''
+
+while [ $# -gt 0 ]; do
+	case "$1" in
+		--help)
+			if fn_exists external_help; then
+				HELP_MSG="$HELP_MSG\n\nProject specific options:"
+				echo "$HELP_MSG"
+				external_help
+			else
+				echo "$HELP_MSG"
+			fi
+			exit 0
+			;;
+		--prefix)
+			PREFIX="$2"
+			shift
+			shift
+			;;
+		--cc)
+			CC="$2"
+			shift
+			shift
+			;;
+		--ar)
+			AR="$2"
+			shift
+			shift
+			;;
+		--extra-cflags)
+			EXTRA_CFLAGS=''
+			for i in $2; do
+				EXTRA_CFLAGS="$EXTRA_CFLAGS $i"
+			done
+			shift
+			shift
+			;;
+		--extra-ldflags)
+			EXTRA_LDFLAGS=''
+			for i in $2; do
+				EXTRA_LDFLAGS="$EXTRA_LDFLAGS $i"
+			done
+			shift
+			shift
+			;;
+		--strip-binaries)
+			STRIP_BINARIES=1
+			shift
+			;;
+		--enable-static)
+			STATIC=1
+			shift
+			;;
+		--enable-debug)
+			DEBUG=1
+			shift
+			;;
+		*)
+			if fn_exists external_arg_handler; then
+				external_arg_handler "$@"
+				count=$?
+
+				for i in $(seq "0" "$count"); do
+					shift
+				done
+
+				if [ "$count" -eq 0 ]; then
+					echo "Invalid option \"$1\""
+					echo "$HELP_MSG"
+					if fn_exists external_help; then
+						external_help
+					fi
+					exit 1
+				fi
+			fi
+			;;
+	esac
+done
+
+handle_sources() {
+	local sources="$@"
+
+	for directory in $sources; do
+		if ! test -d "$SRCDIR/$directory"; then
+			echo "Directory $SRCDIR/$directory does not exist!"
+			exit 1
+		fi
+
+		if ! test -f "$SRCDIR/$directory/prepare"; then
+			echo "Expected file $SRCDIR/$directory/prepare but couldn't find it, skipping!"
+			continue
+		fi
+		pushd "$SRCDIR/$directory" > /dev/null
+		. ./prepare
+
+		if ! fn_exists generate_targets || ! fn_exists per_target; then
+			echo "generate_targets and per_target must exist in prepare!"
+			exit 1
+		fi
+
+		local targets="$(generate_targets | xargs)"
+
+		for target in $targets; do
+			if item_exists "$target" "$generated_targets"; then
+				echo "Target $target already exists!"
+				exit 1
+			fi
+
+			build_sh="${build_sh}${target}() {\n"
+			generated_targets="$generated_targets $target"
+			local files="$(per_target $target)"
+			local created_dir=0
+
+			if fn_exists per_target_head; then
+				build_sh="${build_sh}$(per_target_head $target)\n"
+			fi
+
+			for file in $files; do
+				OUTFILE=$(printf "%s" "$file" | sed 's/\.c$/.o/' | sed "s|^$SRCDIR/|$SRCDIR/build/|")
+				if [ "$created_dir" = 0 ]; then
+					build_sh="${build_sh}$(printf "    %s" "mkdir -p '$(dirname "$OUTFILE")'")\n"
+					created_dir=1
+				fi
+				build_sh="${build_sh}$(printf '    %s %s -c %s -o %s %s' '$CC' '$CFLAGS' "$file" "$OUTFILE" '$LDFLAGS')"
+
+				build_sh="${build_sh}\n    compiled_files=\"\$compiled_files $OUTFILE\"\n"
+			done
+			if fn_exists per_target_tail; then
+				build_sh="${build_sh}$(per_target_tail $target)\n"
+			fi
+			build_sh="${build_sh}}\n\n"
+		done
+		
+		popd > /dev/null
+	done
+}
+
+CMD="$0 $*"
+
+preconfigure=$(find $SRCDIR/.build.sh/ -name '*preconfigure.sh' 2> /dev/null)
+
+len=$(echo "$preconfigure" | wc -l)
+if [ "$len" -eq 1 ]; then
+	. "$preconfigure"
+elif [ "$len" -gt 1 ]; then
+	echo 'Only one *preconfigure.sh file can exist in .build.sh/'
+	exit 1
+fi
+
+if [ "$DEBUG" = 1 ]; then
+    EXTRA_CFLAGS="$EXTRA_CFLAGS -g -D_DEBUG"
+fi
+
+FORMAT_STR="Default config:
+Source Dir:\t%s
+Prefix:\t\t%s
+CC:\t\t%s
+AR:\t\t%s
+Strip:\t\t%s
+CFlags:\t\t%s
+LDFlags:\t%s
+Static:\t\t%s
+Debug:\t\t%s
+"
+FORMAT_ARGS="$SRCDIR $PREFIX $CC $AR $STRIP_BINARIES \"$EXTRA_CFLAGS\" \"$EXTRA_LDFLAGS\" $STATIC $DEBUG"
+
+build_sh="#!/usr/bin/env sh
+# File generated with $CMD
+# However feel free to edit this
+
+### POSIX NON-COMPLAINT UTILS
+
+dir_stack=''
+
+pushd() {
+	dir_stack=\"\$PWD \$dir_stack\"
+	cd "\$1"
+}
+
+popd() {
+	cd \"\${dir_stack%% *}\"
+	dir_stack=\"\${dir_stack#* }\"
+}
+
+item_exists() {
+	for item in \$2; do
+		[ \"\$item\" = \"\$1\" ] && return 0
+	done
+	return 1
+}
+
+match_pattern() {
+	case \"\$1\" in
+		\$2)
+			return 0
+			;;
+		*)
+			return 1
+			;;
+	esac
+}
+
+### END
+
+SRCDIR='$SRCDIR'
+PREFIX='$PREFIX'
+CC='$CC'
+AR='$AR'
+CFLAGS='$EXTRA_CFLAGS'
+LDFLAGS='$EXTRA_LDFLAGS'
+STRIP_BINARIES=$STRIP_BINARIES
+STATIC=$STATIC
+DEBUG=$DEBUG\n"
+
+if fn_exists external_options; then
+	build_sh="${build_sh}$(external_options)\n\n"
+fi
+
+if fn_exists external_format; then
+	FORMAT_STR="${FORMAT_STR}\nProject specific config:\n"
+	external_format
+fi
+
+sources=''
+if fn_exists external_sources; then
+	sources="${sources}$(external_sources)"
+else
+	sources='src'
+fi
+
+build_sh="${build_sh}compiled_files=''\nexecuted_targets=''\n\n"
+
+handle_sources $sources
+
+custom_targets="$(find .build.sh/targets/ -type f 2> /dev/null | rev | cut -d'/' -f1 | rev)"
+custom_functions="$(find .build.sh/functions/ -type f 2> /dev/null | rev | cut -d'/' -f1 | rev)"
+
+for custom_target in $custom_targets; do
+	if item_exists "$custom_target" "$generated_targets"; then
+		echo "Target $target already exists!"
+		exit 1
+	fi
+
+	build_sh="${build_sh}${custom_target}() {\n"
+	build_sh="${build_sh}    . $SRCDIR/.build.sh/targets/$custom_target"
+	build_sh="${build_sh}\n}\n\n"
+	generated_targets="${generated_targets} $custom_target"
+done
+
+for custom_fn in $custom_functions; do
+	build_sh="${build_sh}${custom_fn}() {\n"
+	build_sh="${build_sh}    . $SRCDIR/.build.sh/functions/$custom_fn"
+	build_sh="${build_sh}\n}\n\n"
+done
+
+build_sh="${build_sh}TARGETS='$generated_targets'\n"
+
+build_sh="${build_sh}\nfor arg in \$@; do\n"
+build_sh="${build_sh}    if item_exists \$arg \"\$TARGETS\"; then\n"
+build_sh="${build_sh}        \"\$arg\"\n"
+build_sh="${build_sh}		executed_targets=\"\$executed_targets \$arg\"\n"
+build_sh="${build_sh}    fi\n"
+build_sh="${build_sh}done"
+
+if [ -f "build.sh" ]; then
+	if ! prompt_yes_no "File build.sh exists! Override?"; then
+		echo 'Okay, I will not override build.sh!'
+		exit 0
+	fi
+fi
+
+echo "$build_sh" > build.sh
+chmod +x build.sh
+
+eval "printf \"$FORMAT_STR\" $FORMAT_ARGS"
+
+echo "\nbuild.sh generated!"

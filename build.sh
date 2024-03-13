@@ -29,7 +29,7 @@ build_helper() {
 		exit 1
 	fi
 
-	if [ $# == 0 ]; then
+	if [ $# = 0 ]; then
 		printf "Found targets: "
 
 		for target in $TARGETS; do
